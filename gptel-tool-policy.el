@@ -3,6 +3,7 @@
 ;; A path-based security policy layer for filesystem tools invoked through
 ;; gptel.  It installs a single function on `gptel-pre-tool-call-functions'
 ;; and enforces ordered allow / deny / ask rules against normalized paths.
+;; Tools named in the bypass list are exempt: they skip the policy entirely.
 ;;
 ;; Quick start:
 ;;
@@ -21,6 +22,7 @@
 ;;   M-x gptel-tool-policy-whitelist-path  allow one path
 ;;   M-x gptel-tool-policy-remove-rule     remove a single session rule
 ;;   M-x gptel-tool-policy-clear-rules     clear a scope's session rules
+;;   M-x gptel-tool-policy-add-bypass      exempt one tool from the policy
 ;;   M-x gptel-tool-policy-show-rules      show the effective rule set
 ;;
 ;; Rule format: (ACTION CLASS PATTERN COMMENT)
@@ -34,6 +36,17 @@
 ;; place denies for dangerous paths before broader allows.
 ;;
 ;; Components:
+;;
+;;   * Bypass list -- the first thing the hook consults.  A tool whose name
+;;     appears in `gptel-tool-policy-bypass-tools' (defcustom, persistent) or
+;;     in `gptel-tool-policy-global-bypass-tools' (session-only) is exempt
+;;     from the policy: the hook returns nil at once, with no path
+;;     extraction, no registry lookup, no rule evaluation and no
+;;     confirmation.  The two layers are a disjunction -- presence in either
+;;     is enough -- so unlike rules, they carry no precedence and their order
+;;     is immaterial.  Add to the session layer with
+;;     `gptel-tool-policy-add-bypass'.  This is unconditional trust; see the
+;;     docstring of `gptel-tool-policy-bypass-tools' before using it.
 ;;
 ;;   * Tool registry -- `gptel-tool-policy-tool-registry' maps a tool name to
 ;;     a plist (:class CLASS :extractor FUNCTION).  CLASS is an operation
@@ -62,7 +75,8 @@
 ;;
 ;;   * Interactive commands -- `gptel-tool-policy-add-rule',
 ;;     `gptel-tool-policy-whitelist-cwd', `gptel-tool-policy-whitelist-path',
-;;     `gptel-tool-policy-remove-rule', `gptel-tool-policy-clear-rules' and
+;;     `gptel-tool-policy-remove-rule', `gptel-tool-policy-clear-rules',
+;;     `gptel-tool-policy-add-bypass' and
 ;;     `gptel-tool-policy-show-rules'.  All additions are session-only and
 ;;     are prepended to the front of their layer; the defcustom is never
 ;;     modified.  `gptel-tool-policy-whitelist-path' treats a trailing "/"
@@ -79,7 +93,23 @@
 ;;     predicate would let any project's .dir-locals.el silently replace the
 ;;     policy, handing the kill switch to the material the policy exists to
 ;;     guard against.  Rules must come from your own init file or a session
-;;     command.
+;;     command.  This holds for the bypass list too, which is a kill switch
+;;     by definition.
+;;
+;;   * The bypass list is purely name-based and unconditional.  It inspects
+;;     neither the tool's behaviour nor its arguments, and it outranks the
+;;     whole policy -- the registry and every rule in every layer, including
+;;     the denies shipped in `gptel-tool-policy-rules'.  It is meant for
+;;     tools that never touch the filesystem, or that you trust without
+;;     reservation.  There is deliberately no per-class or per-pattern
+;;     bypass: that granularity belongs in a rule.
+;;
+;;   * A bypass layer whose value is not a proper list grants no bypass at
+;;     all, rather than granting one by accident -- an improper list makes
+;;     `member' return a match for any name before the malformed tail.  Such
+;;     a value is reported once at load time by
+;;     `gptel-tool-policy--validate-bypass-lists'; a value assigned after
+;;     load is not seen by that pass, and simply has no effect.
 
 ;;; Code:
 
@@ -87,6 +117,16 @@
 (require 'subr-x)
 
 (defvar gptel-pre-tool-call-functions)
+
+;; Completion sources for `gptel-tool-policy-add-bypass', declared here so
+;; that the byte compiler stays quiet whether or not gptel is loaded.
+;; `gptel--known-tools' is documented by gptel as internal; it is the only
+;; way to enumerate tools that are registered but not enabled, and every read
+;; of it is guarded and falls back to the public `gptel-tools' -- see
+;; `gptel-tool-policy--known-tool-names'.
+(defvar gptel--known-tools)
+(defvar gptel-tools)
+(declare-function gptel-tool-name "gptel" (tool))
 
 
 ;;;; Configuration
@@ -175,6 +215,115 @@ Session-only: never persisted.  Managed by the interactive commands.")
 (defvar gptel-tool-policy-global-rules nil
   "Global session rules, consulted after buffer-local rules.
 Session-only: never persisted.  Managed by the interactive commands.")
+
+
+;;;; Tool bypass list
+;;
+;; Two flat lists of tool names that skip the policy altogether.  Presence in
+;; either one is enough: the check is a disjunction, not a layered lookup, so
+;; unlike the rule engine -- where first-match-wins makes order load-bearing --
+;; the order the two are tested in means nothing.
+
+(defcustom gptel-tool-policy-bypass-tools nil
+  "Tool names exempted from the policy, the persistent bypass layer.
+
+A flat list of tool name strings, compared with `equal' against the :name of
+each tool call.  A tool named here is not policed at all: the hook returns
+nil at once, before path extraction, before the registry lookup and before
+any rule is evaluated, and gptel runs the call without asking.
+
+Bypass outranks the entire policy, not merely the registry.  Every rule in
+every layer is skipped, including the denies shipped in the default value of
+`gptel-tool-policy-rules': with \"Read\" listed here, a Read of ~/.ssh/id_rsa
+proceeds silently.  This is unconditional trust, granted by name alone, with
+no inspection of what the tool does or of the arguments it was handed.
+Reserve it for tools that cannot touch the filesystem, or that you trust
+without reservation.  Anything narrower -- one operation class, one
+directory -- belongs in `gptel-tool-policy-rules' as an `allow' rule, where
+it stays visible and bounded.
+
+`gptel-tool-policy-global-bypass-tools' is the session-only equivalent.  The
+two are a disjunction: a name in either bypasses, so neither takes precedence
+over the other and their order is immaterial.
+
+Like every defcustom in this package, this one deliberately has no `:safe'
+predicate.  A `:safe' predicate would let any project's .dir-locals.el add
+entries here -- that is, let the material the policy exists to guard against
+switch the policy off for the tools of its own choosing.  Set this in your
+init file, or use \\[gptel-tool-policy-add-bypass] for the current session.
+
+A value that is not a proper list grants no bypass at all, and is reported at
+load time by `gptel-tool-policy--validate-bypass-lists'.  Non-string entries
+in an otherwise well-formed list are harmless: they simply never match."
+  :type '(repeat string)
+  :group 'gptel-tool-policy)
+
+(defvar gptel-tool-policy-global-bypass-tools nil
+  "Tool names exempted from the policy for this session.
+Session-only: never persisted.  Managed by `gptel-tool-policy-add-bypass'.
+There is no clear command for a list this simple; reset it with
+`setq' or by restarting Emacs.
+
+Semantics, and the security implications, are those of
+`gptel-tool-policy-bypass-tools' -- read that docstring before adding
+anything here.  The two lists are a disjunction, so neither takes precedence
+over the other.")
+
+(defun gptel-tool-policy--bypassed-p (name)
+  "Return non-nil when the tool called NAME is exempt from the policy.
+
+NAME is exempt when it appears in `gptel-tool-policy-global-bypass-tools' or
+in `gptel-tool-policy-bypass-tools'.  The test is a disjunction: the order
+the two layers are examined in is not a precedence.
+
+Each layer is guarded with `proper-list-p', which is load-bearing rather than
+decorative.  `member' signals on an atom, but against an improper list such
+as the dotted pair of \"Read\" and \"Grep\" it matches any name positioned
+before the malformed tail and never reaches the error -- so an unguarded test
+would let a broken configuration grant the bypass instead of withholding it.
+A layer that is not a proper list contributes nothing, exactly as if it were
+empty, and the call falls through to normal evaluation.
+
+A NAME that is not a string is never exempt, so a tool call arriving without
+a :name cannot be waved through by a stray nil in a list.
+
+This runs on every tool call and is side-effect free by design: no warning,
+no message, no state.  Malformed layers are diagnosed once at load time, by
+`gptel-tool-policy--validate-bypass-lists'."
+  (and (stringp name)
+       (or (and (proper-list-p gptel-tool-policy-global-bypass-tools)
+                (member name gptel-tool-policy-global-bypass-tools))
+           (and (proper-list-p gptel-tool-policy-bypass-tools)
+                (member name gptel-tool-policy-bypass-tools)))))
+
+(defun gptel-tool-policy--validate-bypass-lists ()
+  "Warn about each bypass variable whose value is not a proper list.
+
+Return non-nil when both `gptel-tool-policy-bypass-tools' and
+`gptel-tool-policy-global-bypass-tools' are well formed; otherwise return
+nil, having emitted one warning per offending variable, naming it and showing
+its value.
+
+Called once when this file is loaded, independently of
+`gptel-tool-policy-enable-on-load': a malformed configuration is worth
+reporting whether or not the policy is armed.  That catches the realistic
+authoring mistake, a typo'd list in an init file, but it cannot see a value
+assigned afterwards by `setq' or through `customize'.  Such a value is still
+harmless -- `gptel-tool-policy--bypassed-p' withholds the bypass either way --
+but it will silently do nothing, so call this by hand if you want it checked."
+  (let ((valid t))
+    (dolist (symbol '(gptel-tool-policy-bypass-tools
+                      gptel-tool-policy-global-bypass-tools))
+      (let ((value (symbol-value symbol)))
+        (unless (proper-list-p value)
+          (setq valid nil)
+          (display-warning
+           'gptel-tool-policy
+           (format
+            "%s is not a proper list (%S); it grants no bypass and is ignored."
+            symbol value)
+           :warning))))
+    valid))
 
 
 ;;;; Argument access helpers
@@ -613,13 +762,25 @@ TOOL-CALL is the plist (:name :args :buffer :backend :model) supplied by
 `gptel-pre-tool-call-functions'.  Returns `(:block MESSAGE)', `(:confirm t)'
 or nil.  Any internal error fails safe to `(:confirm t)'.
 
+nil is also returned, immediately, when the tool is exempt under
+`gptel-tool-policy--bypassed-p' -- the earliest possible exit, taken before
+path extraction, the registry lookup and every rule.  See
+`gptel-tool-policy-bypass-tools'.
+
 TOOL-CALL is treated as read-only: the policy never rewrites :args, so it can
 neither redirect a call nor be used as a path-rewriting sandbox -- that is out
 of scope by design."
   (condition-case err
-      (gptel-tool-policy--evaluate (plist-get tool-call :name)
-                                   (plist-get tool-call :args)
-                                   (plist-get tool-call :buffer))
+      ;; The body of a `condition-case' is a single form, so the bypass test
+      ;; lives inside this `let' rather than sitting before it.  With the
+      ;; `proper-list-p' guards in place the test cannot signal, which makes
+      ;; the wrapping belt and braces here rather than load-bearing.
+      (let ((name (plist-get tool-call :name)))
+        (if (gptel-tool-policy--bypassed-p name)
+            nil
+          (gptel-tool-policy--evaluate name
+                                       (plist-get tool-call :args)
+                                       (plist-get tool-call :buffer))))
     (error
      (display-warning
       'gptel-tool-policy
@@ -838,6 +999,150 @@ Rules from `gptel-tool-policy-rules' are never touched."
       (message "Cleared %d buffer-local session rule%s in %s"
                count (if (= count 1) "" "s") (buffer-name)))))
 
+(defun gptel-tool-policy--alist-string-keys (alist)
+  "Return the string keys of ALIST, in order.
+Any shape is tolerated: a non-list, an improper list, entries that are not
+conses and entries whose key is not a string are skipped rather than
+signalling.  One of the alists this walks is private to gptel, so it has to
+survive an upstream restructure without breaking the command that uses it."
+  (let ((tail alist) (keys '()))
+    (while (consp tail)
+      (let ((cell (car tail)))
+        (when (and (consp cell) (stringp (car cell)))
+          (push (car cell) keys)))
+      (setq tail (cdr tail)))
+    (nreverse keys)))
+
+(defun gptel-tool-policy--known-tool-names (&optional with-source)
+  "Return tool names for `gptel-tool-policy-add-bypass', sorted and deduped.
+
+Three sources are tried in order; the first that yields anything wins:
+
+  1. `gptel--known-tools' -- every tool registered with gptel, enabled or
+     not.  This is the list the bypass command wants, since it lets you
+     name a tool you have not enabled yet, but the variable is internal to
+     gptel, which is why the two fallbacks below exist.
+  2. `gptel-tools' -- the enabled tools only, read through the public
+     accessor `gptel-tool-name'.
+  3. `gptel-tool-policy-tool-registry' -- the tools this policy covers.
+
+Falling back on an empty level 1 as well as an unbound one matters: gptel can
+be loaded with no tools registered yet, and completion with `require-match'
+against an empty table would make the command impossible to complete.
+
+With WITH-SOURCE non-nil, return a cons cell of SOURCE and NAMES instead of
+NAMES alone, where SOURCE is `known-tools', `enabled' or `registry'; the
+command uses it to say that the offered list is narrower than intended.
+Never signals, whatever shape those sources are in."
+  (let* ((source 'known-tools)
+         (names
+          (and (boundp 'gptel--known-tools)
+               (let ((tail gptel--known-tools) (acc '()))
+                 (while (consp tail)
+                   (let ((category (car tail)))
+                     (when (consp category)
+                       (setq acc
+                             (nconc acc (gptel-tool-policy--alist-string-keys
+                                         (cdr category))))))
+                   (setq tail (cdr tail)))
+                 acc))))
+    (unless names
+      (setq source 'enabled
+            names (and (boundp 'gptel-tools)
+                       (fboundp 'gptel-tool-name)
+                       (let ((tail gptel-tools) (acc '()))
+                         (while (consp tail)
+                           (let ((name (ignore-errors
+                                         (gptel-tool-name (car tail)))))
+                             (when (stringp name) (push name acc)))
+                           (setq tail (cdr tail)))
+                         (nreverse acc)))))
+    (unless names
+      (setq source 'registry
+            names (gptel-tool-policy--alist-string-keys
+                   gptel-tool-policy-tool-registry)))
+    (setq names (sort (delete-dups names) #'string<))
+    (if with-source (cons source names) names)))
+
+;;;###autoload
+(defun gptel-tool-policy-add-bypass (name)
+  "Exempt the tool called NAME from the policy for this session.
+
+NAME is prepended to `gptel-tool-policy-global-bypass-tools', after which
+every call to that tool skips path extraction, the registry and every rule,
+and runs without confirmation.  Read the docstring of
+`gptel-tool-policy-bypass-tools' first: this is unconditional trust, and it
+overrides the deny rules shipped for ~/.ssh, ~/.gnupg and friends.
+
+Interactively, NAME is completed from the tools gptel knows about, enabled or
+not, and must be one of them.  The prompt says so when that list had to fall
+back to a narrower source; see `gptel-tool-policy--known-tool-names'.
+
+Nothing is added when NAME is already covered by either layer -- the layer
+covering it is reported instead -- so running this twice is a no-op.  The
+defcustom is never modified.  Returns the session bypass list."
+  (interactive
+   (let* ((table (gptel-tool-policy--known-tool-names t))
+          (names (cdr table))
+          (prompt (cond
+                   ((eq (car table) 'enabled)
+                    "Bypass tool (list degraded to gptel's enabled tools): ")
+                   ((eq (car table) 'registry)
+                    "Bypass tool (list degraded to the policy registry): ")
+                   (t "Bypass tool: "))))
+     (unless names
+       (user-error "No tool names to complete against; is gptel loaded?"))
+     (list (completing-read prompt names nil t))))
+  (unless (stringp name)
+    (user-error "Tool name must be a string: %S" name))
+  (let ((name (string-trim name)))
+    (when (string-empty-p name)
+      (user-error "Empty tool name"))
+    ;; Consing onto a malformed list would produce a longer malformed list,
+    ;; which grants no bypass at all: say so instead of pretending to work.
+    (unless (proper-list-p gptel-tool-policy-global-bypass-tools)
+      (user-error "%s is not a proper list (%S); reset it with setq first"
+                  'gptel-tool-policy-global-bypass-tools
+                  gptel-tool-policy-global-bypass-tools))
+    (let ((covered
+           (cond ((member name gptel-tool-policy-global-bypass-tools) 'global)
+                 ((and (proper-list-p gptel-tool-policy-bypass-tools)
+                       (member name gptel-tool-policy-bypass-tools))
+                  'default))))
+      (if covered
+          (message "%s already bypasses the policy (%s layer); nothing added"
+                   name covered)
+        (setq gptel-tool-policy-global-bypass-tools
+              (cons name gptel-tool-policy-global-bypass-tools))
+        (message "%s now bypasses the policy entirely (global session layer)"
+                 name))
+      gptel-tool-policy-global-bypass-tools)))
+
+(defun gptel-tool-policy--bypass-description ()
+  "Return the \"Bypass tools\" field of `gptel-tool-policy-show-rules'.
+Layers are labeled with the `global' and `default' vocabulary the rule
+listing already uses, an empty layer is omitted, and the whole field reads
+\"none\" when both are empty.  A layer whose value is not a proper list is
+reported as ignored rather than dropped silently: it grants no bypass at all
+\(see `gptel-tool-policy--bypassed-p'), which is worth seeing here."
+  (let* ((layers (list (cons "global" gptel-tool-policy-global-bypass-tools)
+                       (cons "default" gptel-tool-policy-bypass-tools)))
+         (parts (delq nil
+                      (mapcar
+                       (lambda (layer)
+                         (let ((label (car layer))
+                               (value (cdr layer)))
+                           (cond
+                            ((not (proper-list-p value))
+                             (format "%s: <malformed, ignored>" label))
+                            ((null value) nil)
+                            (t (format "%s: %s" label
+                                       (mapconcat (lambda (entry)
+                                                    (format "%s" entry))
+                                                  value ", "))))))
+                       layers))))
+    (if parts (mapconcat #'identity parts "; ") "none")))
+
 ;;;###autoload
 (defun gptel-tool-policy-show-rules ()
   "Display the effective rule set in evaluation order, labeled by source."
@@ -864,6 +1169,8 @@ Rules from `gptel-tool-policy-rules' are never touched."
                                              (gptel-tool-policy--sym
                                               (plist-get (cdr cell) :class))))
                                    gptel-tool-policy-tool-registry ", "))
+                (format "Bypass tools          : %s\n"
+                        (gptel-tool-policy--bypass-description))
                 (format "Rules in effect       : %d buffer, %d global, %d default\n\n"
                         (seq-count (lambda (e) (eq (car e) 'buffer)) entries)
                         (seq-count (lambda (e) (eq (car e) 'global)) entries)
@@ -889,6 +1196,12 @@ Rules from `gptel-tool-policy-rules' are never touched."
     buffer))
 
 (provide 'gptel-tool-policy)
+
+;; Report a bypass list that is not a proper list.  Such a value grants no
+;; bypass -- see `gptel-tool-policy--bypassed-p' -- so this is unconditional:
+;; a configuration that is being discarded is worth knowing about whether or
+;; not the policy is armed at load.
+(gptel-tool-policy--validate-bypass-lists)
 
 ;; Arm the policy as soon as this file is loaded: a security layer you forgot
 ;; to switch on protects nothing.  Set `gptel-tool-policy-enable-on-load' to
