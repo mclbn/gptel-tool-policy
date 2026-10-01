@@ -32,8 +32,12 @@
 ;;   (ask   read  "~/**"          "Ask elsewhere in $HOME")
 ;;
 ;; Patterns: "DIR/**" recursive match, "PREFIX*" prefix match, otherwise
-;; exact match.  Rules are evaluated in order; the first match wins, so
-;; place denies for dangerous paths before broader allows.
+;; exact match.  A "*" anywhere else makes the rule malformed: it is refused
+;; by `gptel-tool-policy-add-rule', flagged by `gptel-tool-policy-show-rules'
+;; and ignored.  Glob patterns such as "~/**/*.pem" are not supported; real
+;; glob matching would be a welcome future addition.  Rules are evaluated in
+;; order; the first match wins, so place denies for dangerous paths before
+;; broader allows.
 ;;
 ;; Components:
 ;;
@@ -66,10 +70,18 @@
 ;;     If any checked path is denied, the whole call is blocked with
 ;;     `(:block MESSAGE)'.  Otherwise, if any path asks, `(:confirm t)' is
 ;;     returned and gptel's own confirmation overlay handles it.  Only when
-;;     every path is explicitly allowed does the hook return nil.
+;;     every path is allowed does the hook return `(:confirm nil)', which
+;;     also overrides the :confirm slot of tools that ask by themselves.
+;;
+;;     Symlinks: the truename of each path is what gets decided.  A rule
+;;     naming a path through a symlink still denies or asks for that path
+;;     as written, but an allow rule must name the real location; the
+;;     interactive commands resolve symlinks for you.  A directory is
+;;     checked as a tree: a deny or ask rule anchored inside it applies to
+;;     the whole call, since Grep, Glob and Edit diffs reach all of it.
 ;;
 ;;     Paths are expanded in the tool call's own buffer, so a relative path
-;;     (Glob's default ".", diff targets) resolves against that buffer's
+;;     (Glob's default ".", a relative Edit path) resolves against that buffer's
 ;;     `default-directory' rather than whatever buffer happens to be current
 ;;     when the hook runs.
 ;;
@@ -86,6 +98,10 @@
 ;; Design constraints (by design):
 ;;
 ;;   * The Bash tool is not covered.  MCP filesystem tools are out of scope.
+;;     gptel only runs `gptel-pre-tool-call-functions' for requests whose
+;;     state machine has a TPRE state: `gptel-send', gptel-rewrite and
+;;     gptel-agent sub-agents.  A plain `gptel-request' call with tools
+;;     skips the hook, and so the policy.
 ;;     Tramp matching applies to the local part of a remote path only (with
 ;;     a warning).
 ;;
@@ -161,7 +177,8 @@ CLASS   the operation class the rule applies to, `read' or `write'.
 PATTERN a path pattern.  \"DIR/**\" matches DIR and everything below it,
         \"PREFIX*\" matches any path starting with PREFIX, anything else
         is an exact path match.  \"~\" and relative parts are expanded
-        before matching.
+        before matching.  A \"*\" anywhere else makes the rule
+        malformed, and it is ignored: glob patterns are not supported.
 COMMENT a descriptive string, shown by `gptel-tool-policy-show-rules' and
         used by the `detailed' deny message.
 
@@ -230,7 +247,8 @@ Session-only: never persisted.  Managed by the interactive commands.")
 A flat list of tool name strings, compared with `equal' against the :name of
 each tool call.  A tool named here is not policed at all: the hook returns
 nil at once, before path extraction, before the registry lookup and before
-any rule is evaluated, and gptel runs the call without asking.
+any rule is evaluated, and gptel's own confirmation settings apply
+\(`gptel-confirm-tool-calls' and the tool's :confirm slot).
 
 Bypass outranks the entire policy, not merely the registry.  Every rule in
 every layer is skipped, including the denies shipped in the default value of
@@ -366,33 +384,12 @@ unreadable.  Do not \"fix\" it into a plain `plist-get'."
           (setq tail (cdr (cdr tail))))
         result)))))
 
-(defun gptel-tool-policy--arg-present-p (args key)
-  "Return non-nil when KEY appears in ARGS at all, whatever its value.
-Distinguishes \"the tool did not send this key\" from \"the tool sent it as
-false\", which `gptel-tool-policy--arg' alone cannot do."
-  (let ((want (gptel-tool-policy--key-name key)))
-    (cond
-     ((not (consp args)) nil)
-     ((consp (car args))
-      (and (seq-find (lambda (cell)
-                       (and (consp cell)
-                            (equal want (gptel-tool-policy--key-name (car cell)))))
-                     args)
-           t))
-     (t
-      (let ((tail args) (found nil))
-        (while (and tail (not found))
-          (when (equal want (gptel-tool-policy--key-name (car tail)))
-            (setq found t))
-          (setq tail (cdr (cdr tail))))
-        found)))))
-
 (defun gptel-tool-policy--string-arg (args key)
-  "Return the value of KEY in ARGS when it is a non-empty string."
+  "Return the value of KEY in ARGS when it is a non-empty string.
+The value is returned unchanged, whitespace included: the tool receives it
+unchanged, so that is what the policy must check."
   (let ((value (gptel-tool-policy--arg args key)))
-    (and (stringp value)
-         (not (string-empty-p (string-trim value)))
-         (string-trim value))))
+    (and (stringp value) (not (string-empty-p value)) value)))
 
 
 ;;;; Path extractors
@@ -411,8 +408,12 @@ Shared by the extractors of tools that name exactly one path argument."
   (gptel-tool-policy--extract-key args :file_path))
 
 (defun gptel-tool-policy--extract-grep (args)
-  "Extract paths checked for a Grep call from ARGS (:path)."
-  (gptel-tool-policy--extract-key args :path))
+  "Extract paths checked for a Grep call from ARGS (:path).
+gptel-agent's Grep searches (substitute-in-file-name PATH), which expands
+environment variables and restarts the path at \"//\" or \"/~\", so that
+form is checked as well."
+  (let ((path (gptel-tool-policy--string-arg args :path)))
+    (if path (delete-dups (list path (substitute-in-file-name path))) '())))
 
 (defun gptel-tool-policy--extract-glob (args)
   "Extract paths checked for a Glob call from ARGS (optional :path)."
@@ -441,57 +442,25 @@ Shared by the extractors of tools that name exactly one path argument."
           (parent (list parent))
           (t '()))))
 
-(defun gptel-tool-policy--diff-target-paths (diff base-dir)
-  "Return the target paths named by \"+++\" headers in DIFF.
-Each header path has an optional \"a/\" or \"b/\" prefix stripped and is
-resolved against BASE-DIR.  \"/dev/null\" targets are ignored."
-  (let ((paths '()))
-    (with-temp-buffer
-      (insert (or diff ""))
-      (goto-char (point-min))
-      (while (re-search-forward "^\\+\\+\\+[ \t]+\\([^\t\n]+\\)" nil t)
-        (let* ((raw (string-trim (match-string 1)))
-               ;; Strip every leading "a/" or "b/", not just one: "b//x"
-               ;; must not become the absolute path "/x".
-               (stripped (replace-regexp-in-string "\\`[ab]/+" "" raw))
-               (rebased (if (and (not (string= raw stripped))
-                                 (file-name-absolute-p stripped))
-                            (concat "./" (string-remove-prefix "/" stripped))
-                          stripped)))
-          (unless (or (string-empty-p stripped) (string= stripped "/dev/null"))
-            (push (expand-file-name stripped base-dir) paths)
-            ;; A stripped header that came out absolute is ambiguous: patch may
-            ;; read it either way, so check both.  Extra candidates can only
-            ;; make the verdict stricter.
-            (unless (string= rebased stripped)
-              (push (expand-file-name rebased base-dir) paths))))))
-    (nreverse paths)))
-
 (defun gptel-tool-policy--extract-edit (args)
   "Extract paths checked for an Edit call from ARGS.
 
-:path is ALWAYS checked, whatever the mode: it is the file the tool nominally
-targets, and dropping it would let content decide what gets inspected.
+:path is always checked.  gptel-agent replaces text only when :diff is
+:json-false or :old_str is non-nil; any other call applies :new_str as a
+diff, with \"patch\" run without -p in the directory of :path.  patch then
+keeps only the basename of whichever header name it picks (\"---\",
+\"+++\", \"Index:\", git headers, indented or quoted), and can create,
+delete or rename files and create symlinks there.  So the headers say
+nothing reliable, and the directory itself is checked instead; being a
+directory, it is checked as a tree, see `gptel-tool-policy--decide-tree'."
+  (let ((path (gptel-tool-policy--string-arg args :path))
+        (diff (gptel-tool-policy--arg args :diff))
+        (old-str (gptel-tool-policy--arg args :old_str)))
+    (cond ((null path) '())
+          ((or (eq diff :json-false) old-str) (list path))
+          (t (list path (file-name-directory (expand-file-name path)))))))
 
-Diff mode is taken from the :diff argument when that key is present, and
-inferred from the presence of \"+++\" headers when it is not, so the extractor
-is correct whether or not the tool source declares the mode.  In diff mode the
-\"+++\" headers of :new_str name the files actually touched; each is resolved
-against the directory of :path and added to the list, so a header such as
-\"+++ b/../../.ssh/config\" cannot escape the policy."
-  (let* ((path (gptel-tool-policy--string-arg args :path))
-         (new-str (gptel-tool-policy--arg args :new_str))
-         (diff-flag (gptel-tool-policy--arg args :diff))
-         (diff-mode (if (gptel-tool-policy--arg-present-p args :diff)
-                        (and diff-flag (not (eq diff-flag :json-false)))
-                      t))
-         (base (and path (or (file-name-directory (expand-file-name path))
-                             default-directory)))
-         (diff-paths (and diff-mode (stringp new-str) base
-                          (gptel-tool-policy--diff-target-paths new-str base))))
-    (delete-dups (append (and path (list path)) diff-paths))))
 
-
 ;;;; Tool registry
 
 (defvar gptel-tool-policy-tool-registry
@@ -535,10 +504,9 @@ An existing entry for NAME is replaced."
 
 (defun gptel-tool-policy--path-candidates (path)
   "Return the normalized forms of PATH to match rules against.
-Both the expanded path and its truename are returned (deduplicated), so
-that a symlink pointing from an allowed directory into a denied one is
-still caught, while rules written in terms of a symlinked directory keep
-working.  A remote path warns and is reduced to its local part, unresolved."
+Both the expanded path and its truename are returned (deduplicated), the
+truename last; see `gptel-tool-policy--decide-path' for how each
+counts.  A remote path warns and is reduced to its local part, unresolved."
   (let ((expanded (expand-file-name path)))
     (if (file-remote-p expanded)
         (progn
@@ -557,10 +525,15 @@ working.  A remote path warns and is reduced to its local part, unresolved."
   "Expand PATTERN as a path, keeping any trailing partial component."
   (file-local-name (expand-file-name pattern)))
 
-(defun gptel-tool-policy--match-pattern (pattern path)
+(defun gptel-tool-policy--string= (a b ignore-case)
+  "Return non-nil when strings A and B are equal, ignoring case if IGNORE-CASE."
+  (eq t (compare-strings a nil nil b nil nil ignore-case)))
+
+(defun gptel-tool-policy--match-pattern (pattern path &optional ignore-case)
   "Return non-nil when PATTERN matches the normalized PATH.
 \"DIR/**\" is checked first (recursive match of DIR and everything under
-it), then \"PREFIX*\" (prefix match), then an exact path match."
+it), then \"PREFIX*\" (prefix match), then an exact path match.  With
+IGNORE-CASE non-nil, letter case is not significant."
   (when (and (stringp pattern) (stringp path) (not (string-empty-p pattern)))
     (cond
      ;; 1. Recursive directory match.
@@ -570,18 +543,21 @@ it), then \"PREFIX*\" (prefix match), then an exact path match."
                     (if (string-empty-p raw)
                         "/"
                       (gptel-tool-policy--expand-pattern raw)))))
-        (or (string= (directory-file-name path) base)
-            (string-prefix-p (file-name-as-directory base) path))))
+        (or (gptel-tool-policy--string= (directory-file-name path) base ignore-case)
+            (string-prefix-p (file-name-as-directory base) path ignore-case))))
      ;; 2. Prefix match.
      ((string-suffix-p "*" pattern)
       (let ((prefix (substring pattern 0 -1)))
         (if (string-empty-p prefix)
             t
-          (string-prefix-p (gptel-tool-policy--expand-pattern prefix) path))))
+          (string-prefix-p (gptel-tool-policy--expand-pattern prefix) path
+                           ignore-case))))
      ;; 3. Exact match.
      (t
-      (string= (directory-file-name (gptel-tool-policy--expand-pattern pattern))
-               (directory-file-name path))))))
+      (gptel-tool-policy--string=
+       (directory-file-name (gptel-tool-policy--expand-pattern pattern))
+       (directory-file-name path)
+       ignore-case)))))
 
 
 ;;;; Rule accessors and the effective rule list
@@ -604,19 +580,42 @@ it), then \"PREFIX*\" (prefix match), then an exact path match."
     (and (stringp comment) (not (string-empty-p comment)) comment)))
 
 (defun gptel-tool-policy--rule-valid-p (rule)
-  "Return non-nil when RULE is well formed."
+  "Return non-nil when RULE is well formed.
+A pattern may contain \"*\" only as its \"/**\" or \"*\" ending.  Any
+other \"*\" would be matched literally, so the rule would silently never
+match; rejecting it lets `gptel-tool-policy-add-rule' refuse it and
+`gptel-tool-policy-show-rules' flag it."
+  ;; Supporting real glob patterns here would be a welcome future addition.
   (and (consp rule)
        (memq (gptel-tool-policy--rule-action rule) '(allow deny ask))
        (gptel-tool-policy--rule-class rule)
-       (stringp (gptel-tool-policy--rule-pattern rule))
-       (not (string-empty-p (gptel-tool-policy--rule-pattern rule)))))
+       (let ((pattern (gptel-tool-policy--rule-pattern rule)))
+         (and (stringp pattern)
+              (not (string-empty-p pattern))
+              (not (string-match-p
+                    "\\*" (replace-regexp-in-string
+                           "\\(?:/\\*\\*\\|\\*\\)\\'" "" pattern)))))))
 
 (defun gptel-tool-policy--rule-matches-p (rule class path)
-  "Return non-nil when RULE covers CLASS and matches PATH."
+  "Return non-nil when RULE covers CLASS and matches PATH.
+`deny' and `ask' rules ignore letter case: on a case-insensitive filesystem
+\"~/.SSH\" is \"~/.ssh\", and over-matching a restrictive rule is safe."
   (and (gptel-tool-policy--rule-valid-p rule)
        (eq (gptel-tool-policy--rule-class rule) class)
-       (gptel-tool-policy--match-pattern (gptel-tool-policy--rule-pattern rule)
-                                         path)))
+       (gptel-tool-policy--match-pattern
+        (gptel-tool-policy--rule-pattern rule) path
+        (not (eq (gptel-tool-policy--rule-action rule) 'allow)))))
+
+(defun gptel-tool-policy--rule-anchor (rule)
+  "Return the expanded path the pattern of the valid RULE is anchored at.
+That is DIR for \"DIR/**\", PREFIX for \"PREFIX*\" and the path itself
+for an exact pattern; nil for \"/**\" and \"*\", anchored nowhere."
+  (let* ((pattern (gptel-tool-policy--rule-pattern rule))
+         (raw (cond ((string-suffix-p "/**" pattern) (substring pattern 0 -3))
+                    ((string-suffix-p "*" pattern) (substring pattern 0 -1))
+                    (t pattern))))
+    (unless (string-empty-p raw)
+      (gptel-tool-policy--expand-pattern raw))))
 
 (defun gptel-tool-policy--target-buffer (buffer)
   "Return a live buffer for BUFFER, else the current buffer.
@@ -657,25 +656,52 @@ rules, then `gptel-tool-policy-rules'."
   "Decide CLASS access to PATH under RULES, first-match-wins.
 
 Return a plist (:action ACTION :rule RULE :path CHECKED).  RULE is nil when
-no rule matched and `gptel-tool-policy-default-action' applied.  Both the
-expanded path and its truename are checked; the more restrictive outcome
-wins."
-  (let ((decision nil))
-    (dolist (candidate (gptel-tool-policy--path-candidates path))
-      (let* ((rule (seq-find (lambda (r)
-                               (gptel-tool-policy--rule-matches-p r class candidate))
-                             rules))
-             (action (if rule
-                         (gptel-tool-policy--rule-action rule)
-                       (gptel-tool-policy--sym gptel-tool-policy-default-action)))
-             (this (list :action action :rule rule :path candidate)))
-        (when (or (null decision)
-                  (> (gptel-tool-policy--rank action)
-                     (gptel-tool-policy--rank (plist-get decision :action))))
-          (setq decision this))))
+no rule matched and `gptel-tool-policy-default-action' applied.
+
+The truename of PATH, the file actually reached, is decided normally.  PATH
+as written, when it differs, counts only through a rule that matches it,
+and only when that rule is more restrictive: it catches a deny written in
+terms of a symlink, but having no rule of its own it does not fall back to
+the default action, which would override an allow matching the truename."
+  (let* ((candidates (gptel-tool-policy--path-candidates path))
+         (real (car (last candidates)))
+         (decision nil))
+    (dolist (candidate candidates)
+      (let ((rule (seq-find (lambda (r)
+                              (gptel-tool-policy--rule-matches-p r class candidate))
+                            rules)))
+        (when (or rule (eq candidate real))
+          (let* ((action (if rule
+                             (gptel-tool-policy--rule-action rule)
+                           (gptel-tool-policy--sym gptel-tool-policy-default-action)))
+                 (this (list :action action :rule rule :path candidate)))
+            (when (or (null decision)
+                      (> (gptel-tool-policy--rank action)
+                         (gptel-tool-policy--rank (plist-get decision :action))))
+              (setq decision this))))))
     (or decision
         (list :action (gptel-tool-policy--sym gptel-tool-policy-default-action)
               :rule nil :path path))))
+
+(defun gptel-tool-policy--decide-tree (dir class rules)
+  "Decide CLASS access to the directory DIR and everything below it.
+Grep and Glob read a whole tree, and a diff applied by Edit can write any
+file of its directory, so the decision for DIR alone is not enough: a rule
+anchored inside DIR protects something the call reaches.  The anchor of
+each such rule is decided like any path, and the most restrictive outcome
+wins."
+  (let ((decision (gptel-tool-policy--decide-path dir class rules)))
+    (dolist (candidate (gptel-tool-policy--path-candidates dir) decision)
+      (let ((root (file-name-as-directory candidate)))
+        (dolist (rule rules)
+          (when (and (gptel-tool-policy--rule-valid-p rule)
+                     (eq (gptel-tool-policy--rule-class rule) class))
+            (let ((anchor (gptel-tool-policy--rule-anchor rule)))
+              (when (and anchor (string-prefix-p root anchor t))
+                (let ((nested (gptel-tool-policy--decide-path anchor class rules)))
+                  (when (> (gptel-tool-policy--rank (plist-get nested :action))
+                           (gptel-tool-policy--rank (plist-get decision :action)))
+                    (setq decision nested)))))))))))
 
 (defun gptel-tool-policy--deny-message (decision)
   "Return the message sent to the LLM for a denying DECISION."
@@ -699,13 +725,17 @@ wins."
 
 (defun gptel-tool-policy--evaluate (name args &optional buffer)
   "Evaluate the policy for tool NAME called with ARGS from BUFFER.
-Return `(:block MESSAGE)', `(:confirm t)' or nil.  nil is returned only when
-every checked path was explicitly allowed by a matching rule.
+Return `(:block MESSAGE)', `(:confirm t)' or `(:confirm nil)'.  The last
+is returned only when every checked path is allowed; it is explicit because
+nil would leave gptel to apply its own confirmation settings, and
+gptel-agent's write tools ask by themselves.  A local directory, or any
+path ending in a slash, is checked as a tree, see
+`gptel-tool-policy--decide-tree'.
 
 Paths are expanded, and rules looked up, inside BUFFER when it is live, so a
-relative path -- Glob's default \".\", a diff target -- resolves against the
-tool call's own `default-directory' rather than whatever buffer happens to be
-current when the hook runs."
+relative path -- Glob's default \".\", a relative Edit path -- resolves
+against the tool call's own `default-directory' rather than whatever buffer
+happens to be current when the hook runs."
   (with-current-buffer (gptel-tool-policy--target-buffer buffer)
     (let ((entry (gptel-tool-policy--registry-entry name)))
       (if (null entry)
@@ -742,16 +772,22 @@ current when the hook runs."
                                              gptel-tool-policy-default-action)
                                     :rule nil :path nil))
                       (mapcar (lambda (p)
-                                (gptel-tool-policy--decide-path p class rules))
+                                (if (and (not (file-remote-p (expand-file-name p)))
+                                         (or (directory-name-p p)
+                                             (file-directory-p p)))
+                                    (gptel-tool-policy--decide-tree p class rules)
+                                  (gptel-tool-policy--decide-path p class rules)))
                               paths)))
                    (denied (seq-find (lambda (d) (eq (plist-get d :action) 'deny))
                                      decisions))
-                   (asked (seq-find (lambda (d) (eq (plist-get d :action) 'ask))
+                   ;; Anything but an explicit `allow' asks, so a malformed
+                   ;; default action fails closed.
+                   (asked (seq-find (lambda (d) (not (eq (plist-get d :action) 'allow)))
                                     decisions)))
               (cond
                (denied (list :block (gptel-tool-policy--deny-message denied)))
                (asked (list :confirm t))
-               (t nil))))))))))
+               (t (list :confirm nil)))))))))))
 
 
 ;;;; Hook function -- the only integration point with gptel
@@ -760,9 +796,9 @@ current when the hook runs."
   "Enforce the tool policy for TOOL-CALL.
 TOOL-CALL is the plist (:name :args :buffer :backend :model) supplied by
 `gptel-pre-tool-call-functions'.  Returns `(:block MESSAGE)', `(:confirm t)'
-or nil.  Any internal error fails safe to `(:confirm t)'.
+or `(:confirm nil)'.  Any internal error fails safe to `(:confirm t)'.
 
-nil is also returned, immediately, when the tool is exempt under
+nil is returned, immediately, when the tool is exempt under
 `gptel-tool-policy--bypassed-p' -- the earliest possible exit, taken before
 path extraction, the registry lookup and every rule.  See
 `gptel-tool-policy-bypass-tools'.
@@ -793,13 +829,18 @@ of scope by design."
 (define-minor-mode gptel-tool-policy-mode
   "Enforce path-based policy on every gptel tool call.
 
-When enabled, `gptel-tool-policy--hook' is placed at the front of
-`gptel-pre-tool-call-functions' so that it sees unmodified tool arguments."
+When enabled, `gptel-tool-policy--hook' is added to
+`gptel-pre-tool-call-functions' at depth 100, after other functions: gptel
+runs the arguments as other functions may have rewritten them, so those are
+the ones to check, and the policy's :confirm has the last word.  That
+includes the `(:confirm nil)' of an allowed call, which cancels a
+confirmation an earlier function asked for: the policy cannot see what
+earlier functions returned."
   :global t
   :group 'gptel-tool-policy
   :lighter " ToolPolicy"
   (if gptel-tool-policy-mode
-      (add-hook 'gptel-pre-tool-call-functions #'gptel-tool-policy--hook)
+      (add-hook 'gptel-pre-tool-call-functions #'gptel-tool-policy--hook 100)
     (remove-hook 'gptel-pre-tool-call-functions #'gptel-tool-policy--hook)))
 
 
@@ -827,13 +868,20 @@ When enabled, `gptel-tool-policy--hook' is placed at the front of
   "Prompt for a rule scope, defaulting to buffer."
   (intern (completing-read "Scope: " '("buffer" "global") nil t nil nil "buffer")))
 
+(defun gptel-tool-policy--resolve (path)
+  "Return PATH expanded, with symlinks resolved when PATH is local."
+  (let ((path (expand-file-name path)))
+    (if (file-remote-p path) path (gptel-tool-policy--truename path))))
+
 (defun gptel-tool-policy--pattern-for-file (path)
   "Return a rule pattern for PATH: recursive for a directory, exact otherwise.
 A trailing slash counts as \"directory\" on its own, so a directory that does
 not exist yet -- `read-file-name' is called with MUSTMATCH nil -- still yields
-a recursive \"/**\" pattern instead of an exact-match rule on its name."
+a recursive \"/**\" pattern instead of an exact-match rule on its name.
+Symlinks are resolved: the policy decides on real locations, see
+`gptel-tool-policy--decide-path'."
   (let* ((trailing (directory-name-p path))
-         (path (expand-file-name path)))
+         (path (gptel-tool-policy--resolve path)))
     (if (or trailing (file-directory-p path))
         (concat (directory-file-name path) "/**")
       (directory-file-name path))))
@@ -897,7 +945,8 @@ SCOPE is `buffer' or `global'; the rule lasts for this session only."
   (interactive
    (list (gptel-tool-policy--read-class) (gptel-tool-policy--read-scope)))
   (let ((pattern (concat (directory-file-name
-                          (file-local-name (expand-file-name default-directory)))
+                          (file-local-name
+                           (gptel-tool-policy--resolve default-directory)))
                          "/**")))
     (gptel-tool-policy--prepend-rule
      (list 'allow class pattern
@@ -971,6 +1020,8 @@ Rules from `gptel-tool-policy-rules' are never touched."
              (entry (cdr (assoc choice table)))
              (source (car entry))
              (rule (cdr entry)))
+        (unless entry
+          (user-error "No rule selected"))
         (if (eq source 'global)
             (setq gptel-tool-policy-global-rules
                   (gptel-tool-policy--remove-first rule gptel-tool-policy-global-rules))
@@ -1069,8 +1120,8 @@ Never signals, whatever shape those sources are in."
   "Exempt the tool called NAME from the policy for this session.
 
 NAME is prepended to `gptel-tool-policy-global-bypass-tools', after which
-every call to that tool skips path extraction, the registry and every rule,
-and runs without confirmation.  Read the docstring of
+every call to that tool skips path extraction, the registry and every rule;
+gptel's own confirmation settings still apply.  Read the docstring of
 `gptel-tool-policy-bypass-tools' first: this is unconditional trust, and it
 overrides the deny rules shipped for ~/.ssh, ~/.gnupg and friends.
 
