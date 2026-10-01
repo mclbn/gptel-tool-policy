@@ -1,5 +1,15 @@
 ;;; gptel-tool-policy.el --- Path-based security policy for gptel tool calls -*- lexical-binding: t; -*-
 
+;; Author: Marc Lebrun <mclbn@users.noreply.github.com>
+;; URL: https://github.com/mclbn/gptel-tool-policy
+;; Version: 0.1
+;; Package-Requires: ((emacs "27.1"))
+;; Keywords: tools, convenience
+
+;; This file is not part of GNU Emacs.
+
+;;; Commentary:
+
 ;; A path-based security policy layer for filesystem tools invoked through
 ;; gptel.  It installs a single function on `gptel-pre-tool-call-functions'
 ;; and enforces ordered allow / deny / ask rules against normalized paths.
@@ -11,9 +21,8 @@
 ;;     (load "/path/to/gptel-tool-policy.el")
 ;;     (gptel-tool-policy-mode 1))
 ;;
-;; Loading the file arms the policy by itself, so the explicit call above is
-;; belt and braces.  Set `gptel-tool-policy-enable-on-load' to nil *before*
-;; loading if you would rather arm it yourself.
+;; Loading the file defines the policy but does not arm it; turn it on with
+;; `gptel-tool-policy-mode', as above or through Customize.
 ;;
 ;; Interactive commands:
 ;;
@@ -60,8 +69,8 @@
 ;;     `gptel-tool-policy-register-tool'), not touching the engine.
 ;;
 ;;   * Policy engine -- normalizes each extracted path (expand-file-name,
-;;     file-truename, Tramp prefix stripped) and evaluates the effective rule
-;;     list first-match-wins across three layers:
+;;     then file-truename to resolve symlinks) and evaluates the effective
+;;     rule list first-match-wins across three layers:
 ;;
 ;;         buffer-local session rules
 ;;       → global session rules
@@ -73,12 +82,17 @@
 ;;     every path is allowed does the hook return `(:confirm nil)', which
 ;;     also overrides the :confirm slot of tools that ask by themselves.
 ;;
-;;     Symlinks: the truename of each path is what gets decided.  A rule
-;;     naming a path through a symlink still denies or asks for that path
-;;     as written, but an allow rule must name the real location; the
-;;     interactive commands resolve symlinks for you.  A directory is
-;;     checked as a tree: a deny or ask rule anchored inside it applies to
-;;     the whole call, since Grep, Glob and Edit diffs reach all of it.
+;;     Symlinks: a path and a rule pattern are both resolved to their real
+;;     location before matching, so a rule decides on the file actually
+;;     reached.  A deny therefore holds whether it, or the path, is written
+;;     through a symlink; an allow applies likewise.  The one gap is a
+;;     symlink that does not exist when the policy runs: see the Edit diff
+;;     and Glob notes below.
+;;
+;;     A directory is checked as a tree, since Grep, Glob and an Edit diff
+;;     reach everything under it.  An exact rule names a single path and does
+;;     not cover a tree; every deny or ask rule anchored at or inside the
+;;     directory applies to the whole call, whatever rule precedes it.
 ;;
 ;;     Paths are expanded in the tool call's own buffer, so a relative path
 ;;     (Glob's default ".", a relative Edit path) resolves against that buffer's
@@ -102,8 +116,22 @@
 ;;     state machine has a TPRE state: `gptel-send', gptel-rewrite and
 ;;     gptel-agent sub-agents.  A plain `gptel-request' call with tools
 ;;     skips the hook, and so the policy.
-;;     Tramp matching applies to the local part of a remote path only (with
-;;     a warning).
+;;
+;;   * Remote (Tramp) paths are matched on their local part only, and are
+;;     never allowed without confirmation: a rule written for a local path
+;;     cannot vouch for another host or for sudo.  The whitelist commands
+;;     refuse a remote directory for the same reason.
+;;
+;;   * An Edit diff that creates a symbolic link is refused outright.  patch
+;;     can create a link pointing anywhere, and the calls of one request are
+;;     decided before any of them run, so a link planted mid-request would
+;;     not have been seen by the policy when a later call was checked.
+;;
+;;   * Glob runs the `tree' program, which follows symbolic links inside the
+;;     directory it lists, so it can report the names of files under a denied
+;;     directory reached through a link in an allowed one.  Only names leak,
+;;     never contents, and Grep does not follow such links.  Closing this
+;;     would mean walking the whole tree in Emacs before every Glob.
 ;;
 ;;   * Defcustoms intentionally omit `:safe' predicates.  A `:safe'
 ;;     predicate would let any project's .dir-locals.el silently replace the
@@ -118,14 +146,14 @@
 ;;     the denies shipped in `gptel-tool-policy-rules'.  It is meant for
 ;;     tools that never touch the filesystem, or that you trust without
 ;;     reservation.  There is deliberately no per-class or per-pattern
-;;     bypass: that granularity belongs in a rule.
+;;     bypass: that granularity belongs in a rule.  A layer whose value is
+;;     not a proper list grants no bypass at all, rather than granting one by
+;;     accident.
 ;;
-;;   * A bypass layer whose value is not a proper list grants no bypass at
-;;     all, rather than granting one by accident -- an improper list makes
-;;     `member' return a match for any name before the malformed tail.  Such
-;;     a value is reported once at load time by
-;;     `gptel-tool-policy--validate-bypass-lists'; a value assigned after
-;;     load is not seen by that pass, and simply has no effect.
+;;   * `gptel-tool-policy-show-rules' reports whether the policy is active in
+;;     the buffer it is called from: a gptel preset can set
+;;     `gptel-pre-tool-call-functions' buffer-locally and leave the global
+;;     hook, and so the policy, out of that buffer.
 
 ;;; Code:
 
@@ -152,11 +180,6 @@
   :group 'gptel
   :group 'tools
   :prefix "gptel-tool-policy-")
-
-(defvar gptel-tool-policy-enable-on-load t
-  "When non-nil, loading this file turns `gptel-tool-policy-mode' on.
-Set this to nil *before* loading if you prefer to arm the policy yourself;
-`defvar' will not clobber a value you have already set.")
 
 (defcustom gptel-tool-policy-rules
   '((deny  read  "~/.ssh/**"       "Never expose SSH keys")
@@ -270,9 +293,9 @@ entries here -- that is, let the material the policy exists to guard against
 switch the policy off for the tools of its own choosing.  Set this in your
 init file, or use \\[gptel-tool-policy-add-bypass] for the current session.
 
-A value that is not a proper list grants no bypass at all, and is reported at
-load time by `gptel-tool-policy--validate-bypass-lists'.  Non-string entries
-in an otherwise well-formed list are harmless: they simply never match."
+A value that is not a proper list grants no bypass at all, and is shown as
+such by `gptel-tool-policy-show-rules'.  Non-string entries in an otherwise
+well-formed list are harmless: they simply never match."
   :type '(repeat string)
   :group 'gptel-tool-policy)
 
@@ -306,52 +329,16 @@ A NAME that is not a string is never exempt, so a tool call arriving without
 a :name cannot be waved through by a stray nil in a list.
 
 This runs on every tool call and is side-effect free by design: no warning,
-no message, no state.  Malformed layers are diagnosed once at load time, by
-`gptel-tool-policy--validate-bypass-lists'."
+no message, no state."
   (and (stringp name)
        (or (and (proper-list-p gptel-tool-policy-global-bypass-tools)
                 (member name gptel-tool-policy-global-bypass-tools))
            (and (proper-list-p gptel-tool-policy-bypass-tools)
                 (member name gptel-tool-policy-bypass-tools)))))
 
-(defun gptel-tool-policy--validate-bypass-lists ()
-  "Warn about each bypass variable whose value is not a proper list.
-
-Return non-nil when both `gptel-tool-policy-bypass-tools' and
-`gptel-tool-policy-global-bypass-tools' are well formed; otherwise return
-nil, having emitted one warning per offending variable, naming it and showing
-its value.
-
-Called once when this file is loaded, independently of
-`gptel-tool-policy-enable-on-load': a malformed configuration is worth
-reporting whether or not the policy is armed.  That catches the realistic
-authoring mistake, a typo'd list in an init file, but it cannot see a value
-assigned afterwards by `setq' or through `customize'.  Such a value is still
-harmless -- `gptel-tool-policy--bypassed-p' withholds the bypass either way --
-but it will silently do nothing, so call this by hand if you want it checked."
-  (let ((valid t))
-    (dolist (symbol '(gptel-tool-policy-bypass-tools
-                      gptel-tool-policy-global-bypass-tools))
-      (let ((value (symbol-value symbol)))
-        (unless (proper-list-p value)
-          (setq valid nil)
-          (display-warning
-           'gptel-tool-policy
-           (format
-            "%s is not a proper list (%S); it grants no bypass and is ignored."
-            symbol value)
-           :warning))))
-    valid))
 
 
 ;;;; Argument access helpers
-
-(defun gptel-tool-policy--key-name (key)
-  "Return the bare name of KEY, a keyword, symbol or string."
-  (cond ((keywordp key) (substring (symbol-name key) 1))
-        ((symbolp key) (symbol-name key))
-        ((stringp key) (string-remove-prefix ":" key))
-        (t (format "%s" key))))
 
 (defun gptel-tool-policy--sym (value)
   "Coerce VALUE to a bare symbol, tolerating keywords and strings."
@@ -361,41 +348,22 @@ but it will silently do nothing, so call this by hand if you want it checked."
         ((stringp value) (intern (downcase (string-remove-prefix ":" value))))
         (t nil)))
 
-(defun gptel-tool-policy--arg (args key)
-  "Return the value of KEY in ARGS.
-ARGS is normally a plist with keyword keys, but alists and string or plain
-symbol keys are tolerated so that differently shaped tool arguments still
-work.  This laxity is deliberate: a tool source that renames or reshapes its
-arguments must not be able to slip a path past the policy by making it
-unreadable.  Do not \"fix\" it into a plain `plist-get'."
-  (let ((want (gptel-tool-policy--key-name key)))
-    (cond
-     ((not (consp args)) nil)
-     ((consp (car args))
-      (cdr (seq-find (lambda (cell)
-                       (and (consp cell)
-                            (equal want (gptel-tool-policy--key-name (car cell)))))
-                     args)))
-     (t
-      (let ((tail args) (found nil) (result nil))
-        (while (and tail (not found))
-          (when (equal want (gptel-tool-policy--key-name (car tail)))
-            (setq found t result (cadr tail)))
-          (setq tail (cdr (cdr tail))))
-        result)))))
-
 (defun gptel-tool-policy--string-arg (args key)
-  "Return the value of KEY in ARGS when it is a non-empty string.
-The value is returned unchanged, whitespace included: the tool receives it
-unchanged, so that is what the policy must check."
-  (let ((value (gptel-tool-policy--arg args key)))
+  "Return the value of KEY in the plist ARGS when it is a non-empty string.
+That is the value the tool receives: gptel reads tool arguments with
+`plist-get'.  It is returned unchanged, whitespace included."
+  (let ((value (plist-get args key)))
     (and (stringp value) (not (string-empty-p value)) value)))
 
-
+
 ;;;; Path extractors
 ;;
-;; Contract: input is the tool call's :args, output is a list of path
-;; strings (possibly empty).  Never a bare string, never nil.
+;; Contract: input is the tool call's :args; output is a list of path strings
+;; (possibly empty).  A non-list or non-string entries are tolerated by the
+;; engine, but returning a clean list is the contract.  As a special case an
+;; extractor may return `(:block MESSAGE)' to refuse the call outright,
+;; whatever the rules say; the Edit extractor uses it for a symlink-creating
+;; diff.
 
 (defun gptel-tool-policy--extract-key (args key)
   "Return the single path named by KEY in ARGS, as a list, or an empty list.
@@ -442,6 +410,18 @@ form is checked as well."
           (parent (list parent))
           (t '()))))
 
+(defun gptel-tool-policy--diff-creates-symlink-p (diff)
+  "Return non-nil when the unified DIFF would make patch create a symlink.
+patch creates a symbolic link from a git \"new file mode 120000\" header,
+with the link target chosen by the diff.  Such a link, planted in an
+allowed directory, could point anywhere, and a later tool call in the same
+request is decided before the link exists -- so the request's view of the
+filesystem would no longer be the one the policy checked.  The diff is
+refused outright; the match is deliberately generous, since over-refusing a
+rare legitimate diff is safe."
+  (and (stringp diff)
+       (string-match-p "^new \\(?:file \\)?mode 120000" diff)))
+
 (defun gptel-tool-policy--extract-edit (args)
   "Extract paths checked for an Edit call from ARGS.
 
@@ -454,23 +434,26 @@ delete or rename files and create symlinks there.  So the headers say
 nothing reliable, and the directory itself is checked instead; being a
 directory, it is checked as a tree, see `gptel-tool-policy--decide-tree'."
   (let ((path (gptel-tool-policy--string-arg args :path))
-        (diff (gptel-tool-policy--arg args :diff))
-        (old-str (gptel-tool-policy--arg args :old_str)))
+        (diff (plist-get args :diff))
+        (old-str (plist-get args :old_str)))
     (cond ((null path) '())
           ((or (eq diff :json-false) old-str) (list path))
+          ((gptel-tool-policy--diff-creates-symlink-p (plist-get args :new_str))
+           (list :block "an Edit diff that creates a symbolic link is refused"))
           (t (list path (file-name-directory (expand-file-name path)))))))
 
 
 ;;;; Tool registry
 
 (defvar gptel-tool-policy-tool-registry
-  '(("Read"   . (:class read  :extractor gptel-tool-policy--extract-read))
-    ("Grep"   . (:class read  :extractor gptel-tool-policy--extract-grep))
-    ("Glob"   . (:class read  :extractor gptel-tool-policy--extract-glob))
-    ("Write"  . (:class write :extractor gptel-tool-policy--extract-write))
-    ("Insert" . (:class write :extractor gptel-tool-policy--extract-insert))
-    ("Edit"   . (:class write :extractor gptel-tool-policy--extract-edit))
-    ("Mkdir"  . (:class write :extractor gptel-tool-policy--extract-mkdir)))
+  (copy-tree
+   '(("Read"   . (:class read  :extractor gptel-tool-policy--extract-read))
+     ("Grep"   . (:class read  :extractor gptel-tool-policy--extract-grep))
+     ("Glob"   . (:class read  :extractor gptel-tool-policy--extract-glob))
+     ("Write"  . (:class write :extractor gptel-tool-policy--extract-write))
+     ("Insert" . (:class write :extractor gptel-tool-policy--extract-insert))
+     ("Edit"   . (:class write :extractor gptel-tool-policy--extract-edit))
+     ("Mkdir"  . (:class write :extractor gptel-tool-policy--extract-mkdir))))
   "Alist mapping a tool name to (:class CLASS :extractor FUNCTION).
 
 CLASS is an operation class symbol; currently `read' and `write'.  A future
@@ -502,28 +485,26 @@ An existing entry for NAME is replaced."
       (file-truename path)
     (error path)))
 
-(defun gptel-tool-policy--path-candidates (path)
-  "Return the normalized forms of PATH to match rules against.
-Both the expanded path and its truename are returned (deduplicated), the
-truename last; see `gptel-tool-policy--decide-path' for how each
-counts.  A remote path warns and is reduced to its local part, unresolved."
+(defun gptel-tool-policy--normalize (path)
+  "Return PATH expanded, with symlinks resolved.
+A remote path is reduced to its local part, unresolved."
   (let ((expanded (expand-file-name path)))
     (if (file-remote-p expanded)
-        (progn
-          (display-warning
-           'gptel-tool-policy
-           (format "Remote (Tramp) path %s: policy matching uses the local part only, and symlinks on the remote host are not resolved."
-                   expanded)
-           :warning)
-          (list (file-local-name expanded)))
-      (delete-dups (list expanded (gptel-tool-policy--truename expanded))))))
+        (file-local-name expanded)
+      (gptel-tool-policy--truename expanded))))
 
-
+
 ;;;; Pattern matching
 
-(defun gptel-tool-policy--expand-pattern (pattern)
-  "Expand PATTERN as a path, keeping any trailing partial component."
-  (file-local-name (expand-file-name pattern)))
+(defun gptel-tool-policy--expand-pattern (pattern &optional partial)
+  "Normalize PATTERN as checked paths are, see `gptel-tool-policy--normalize'.
+With PARTIAL, the last component is a name prefix: only the directory part
+is normalized, so a trailing \".\" or \"..\" is kept as written."
+  (if partial
+      (concat (file-name-as-directory
+               (gptel-tool-policy--normalize (or (file-name-directory pattern) "./")))
+              (file-name-nondirectory pattern))
+    (gptel-tool-policy--normalize pattern)))
 
 (defun gptel-tool-policy--string= (a b ignore-case)
   "Return non-nil when strings A and B are equal, ignoring case if IGNORE-CASE."
@@ -550,7 +531,7 @@ IGNORE-CASE non-nil, letter case is not significant."
       (let ((prefix (substring pattern 0 -1)))
         (if (string-empty-p prefix)
             t
-          (string-prefix-p (gptel-tool-policy--expand-pattern prefix) path
+          (string-prefix-p (gptel-tool-policy--expand-pattern prefix t) path
                            ignore-case))))
      ;; 3. Exact match.
      (t
@@ -587,6 +568,7 @@ match; rejecting it lets `gptel-tool-policy-add-rule' refuse it and
 `gptel-tool-policy-show-rules' flag it."
   ;; Supporting real glob patterns here would be a welcome future addition.
   (and (consp rule)
+       (proper-list-p rule)
        (memq (gptel-tool-policy--rule-action rule) '(allow deny ask))
        (gptel-tool-policy--rule-class rule)
        (let ((pattern (gptel-tool-policy--rule-pattern rule)))
@@ -611,11 +593,18 @@ match; rejecting it lets `gptel-tool-policy-add-rule' refuse it and
 That is DIR for \"DIR/**\", PREFIX for \"PREFIX*\" and the path itself
 for an exact pattern; nil for \"/**\" and \"*\", anchored nowhere."
   (let* ((pattern (gptel-tool-policy--rule-pattern rule))
+         (prefix (and (not (string-suffix-p "/**" pattern))
+                      (string-suffix-p "*" pattern)))
          (raw (cond ((string-suffix-p "/**" pattern) (substring pattern 0 -3))
-                    ((string-suffix-p "*" pattern) (substring pattern 0 -1))
+                    (prefix (substring pattern 0 -1))
                     (t pattern))))
     (unless (string-empty-p raw)
-      (gptel-tool-policy--expand-pattern raw))))
+      (gptel-tool-policy--expand-pattern raw prefix))))
+
+(defun gptel-tool-policy--exact-rule-p (rule)
+  "Return non-nil when RULE is valid and its pattern names a single path."
+  (and (gptel-tool-policy--rule-valid-p rule)
+       (not (string-suffix-p "*" (gptel-tool-policy--rule-pattern rule)))))
 
 (defun gptel-tool-policy--target-buffer (buffer)
   "Return a live buffer for BUFFER, else the current buffer.
@@ -655,58 +644,57 @@ rules, then `gptel-tool-policy-rules'."
 (defun gptel-tool-policy--decide-path (path class rules)
   "Decide CLASS access to PATH under RULES, first-match-wins.
 
-Return a plist (:action ACTION :rule RULE :path CHECKED).  RULE is nil when
-no rule matched and `gptel-tool-policy-default-action' applied.
-
-The truename of PATH, the file actually reached, is decided normally.  PATH
-as written, when it differs, counts only through a rule that matches it,
-and only when that rule is more restrictive: it catches a deny written in
-terms of a symlink, but having no rule of its own it does not fall back to
-the default action, which would override an allow matching the truename."
-  (let* ((candidates (gptel-tool-policy--path-candidates path))
-         (real (car (last candidates)))
-         (decision nil))
-    (dolist (candidate candidates)
-      (let ((rule (seq-find (lambda (r)
-                              (gptel-tool-policy--rule-matches-p r class candidate))
-                            rules)))
-        (when (or rule (eq candidate real))
-          (let* ((action (if rule
-                             (gptel-tool-policy--rule-action rule)
-                           (gptel-tool-policy--sym gptel-tool-policy-default-action)))
-                 (this (list :action action :rule rule :path candidate)))
-            (when (or (null decision)
-                      (> (gptel-tool-policy--rank action)
-                         (gptel-tool-policy--rank (plist-get decision :action))))
-              (setq decision this))))))
-    (or decision
-        (list :action (gptel-tool-policy--sym gptel-tool-policy-default-action)
-              :rule nil :path path))))
+Return a plist (:action ACTION :rule RULE :path CHECKED).  CHECKED is PATH
+normalized, symlinks resolved, and RULE is nil when no rule matched and
+`gptel-tool-policy-default-action' applied.  A remote path is matched on
+its local part, with a warning, and is asked for at least: a rule written
+for a local path cannot vouch for another host."
+  (let* ((remote (file-remote-p (expand-file-name path)))
+         (checked (gptel-tool-policy--normalize path))
+         (rule (seq-find (lambda (r) (gptel-tool-policy--rule-matches-p r class checked))
+                         rules))
+         (action (if rule
+                     (gptel-tool-policy--rule-action rule)
+                   (gptel-tool-policy--sym gptel-tool-policy-default-action))))
+    (when remote
+      (display-warning
+       'gptel-tool-policy
+       (format "Remote (Tramp) path %s: policy matching uses the local part only, and the call is never allowed without confirmation."
+               path)
+       :warning)
+      (when (eq action 'allow) (setq action 'ask)))
+    (list :action action :rule rule :path checked)))
 
 (defun gptel-tool-policy--decide-tree (dir class rules)
   "Decide CLASS access to the directory DIR and everything below it.
 Grep and Glob read a whole tree, and a diff applied by Edit can write any
-file of its directory, so the decision for DIR alone is not enough: a rule
-anchored inside DIR protects something the call reaches.  The anchor of
-each such rule is decided like any path, and the most restrictive outcome
-wins."
-  (let ((decision (gptel-tool-policy--decide-path dir class rules)))
-    (dolist (candidate (gptel-tool-policy--path-candidates dir) decision)
-      (let ((root (file-name-as-directory candidate)))
-        (dolist (rule rules)
-          (when (and (gptel-tool-policy--rule-valid-p rule)
-                     (eq (gptel-tool-policy--rule-class rule) class))
-            (let ((anchor (gptel-tool-policy--rule-anchor rule)))
-              (when (and anchor (string-prefix-p root anchor t))
-                (let ((nested (gptel-tool-policy--decide-path anchor class rules)))
-                  (when (> (gptel-tool-policy--rank (plist-get nested :action))
-                           (gptel-tool-policy--rank (plist-get decision :action)))
-                    (setq decision nested)))))))))))
+file of its directory.  So DIR is decided by the rules that can cover a
+tree -- an exact rule names one path, and allows nothing below it -- and
+then every deny or ask rule anchored at or inside DIR applies to the whole
+call, whatever precedes it."
+  (let* ((decision (gptel-tool-policy--decide-path
+                    dir class (seq-remove #'gptel-tool-policy--exact-rule-p rules)))
+         (root (file-name-as-directory (plist-get decision :path))))
+    (dolist (rule rules decision)
+      (let ((anchor (and (gptel-tool-policy--rule-valid-p rule)
+                         (eq (gptel-tool-policy--rule-class rule) class)
+                         (gptel-tool-policy--rule-anchor rule))))
+        (when (and anchor
+                   (string-prefix-p root (file-name-as-directory anchor) t)
+                   (> (gptel-tool-policy--rank (gptel-tool-policy--rule-action rule))
+                      (gptel-tool-policy--rank (plist-get decision :action))))
+          (setq decision (list :action (gptel-tool-policy--rule-action rule)
+                               :rule rule :path anchor)))))))
 
 (defun gptel-tool-policy--deny-message (decision)
   "Return the message sent to the LLM for a denying DECISION."
   (cond
    ((stringp gptel-tool-policy-deny-message) gptel-tool-policy-deny-message)
+   ((plist-get decision :reason)
+    (if (eq gptel-tool-policy-deny-message 'detailed)
+        (concat "This tool call was blocked by the local security policy: "
+                (plist-get decision :reason) ".")
+      gptel-tool-policy-generic-deny-message))
    ((eq gptel-tool-policy-deny-message 'detailed)
     (let* ((path (plist-get decision :path))
            (rule (plist-get decision :rule))
@@ -747,49 +735,36 @@ happens to be current when the hook runs."
              :warning)
             (list :confirm t))
         (let* ((class (gptel-tool-policy--sym (plist-get entry :class)))
-               (extractor (plist-get entry :extractor))
-               (paths (condition-case err
-                          (funcall extractor args)
-                        (error
-                         (display-warning
-                          'gptel-tool-policy
-                          (format "Path extraction for tool %s failed (%s); asking for confirmation."
-                                  name (error-message-string err))
-                          :warning)
-                         'extract-error))))
+               (rules (gptel-tool-policy--effective-rules (current-buffer)))
+               (extracted (funcall (plist-get entry :extractor) args))
+               (paths (seq-filter (lambda (p) (and (stringp p) (not (string-empty-p p))))
+                                  (if (listp extracted) extracted (list extracted))))
+               (decisions
+                (if (null paths)
+                    ;; Registered tool with no path argument: nothing was
+                    ;; explicitly allowed, so fall back to the default.
+                    (list (list :action (gptel-tool-policy--sym
+                                         gptel-tool-policy-default-action)))
+                  (mapcar (lambda (p)
+                            (if (and (not (file-remote-p (expand-file-name p)))
+                                     (or (directory-name-p p) (file-directory-p p)))
+                                (gptel-tool-policy--decide-tree p class rules)
+                              (gptel-tool-policy--decide-path p class rules)))
+                          paths)))
+               (denied (seq-find (lambda (d) (eq (plist-get d :action) 'deny))
+                                 decisions)))
           (cond
-           ((eq paths 'extract-error) (list :confirm t))
-           (t
-            (let* ((rules (gptel-tool-policy--effective-rules (current-buffer)))
-                   (paths (seq-filter (lambda (p)
-                                        (and (stringp p) (not (string-empty-p p))))
-                                      (if (listp paths) paths (list paths))))
-                   (decisions
-                    (if (null paths)
-                        ;; Registered tool with no path argument: nothing was
-                        ;; explicitly allowed, so fall back to the default.
-                        (list (list :action (gptel-tool-policy--sym
-                                             gptel-tool-policy-default-action)
-                                    :rule nil :path nil))
-                      (mapcar (lambda (p)
-                                (if (and (not (file-remote-p (expand-file-name p)))
-                                         (or (directory-name-p p)
-                                             (file-directory-p p)))
-                                    (gptel-tool-policy--decide-tree p class rules)
-                                  (gptel-tool-policy--decide-path p class rules)))
-                              paths)))
-                   (denied (seq-find (lambda (d) (eq (plist-get d :action) 'deny))
-                                     decisions))
-                   ;; Anything but an explicit `allow' asks, so a malformed
-                   ;; default action fails closed.
-                   (asked (seq-find (lambda (d) (not (eq (plist-get d :action) 'allow)))
-                                    decisions)))
-              (cond
-               (denied (list :block (gptel-tool-policy--deny-message denied)))
-               (asked (list :confirm t))
-               (t (list :confirm nil)))))))))))
+           ((eq (car-safe extracted) :block)
+            (list :block (gptel-tool-policy--deny-message
+                          (list :action 'deny :reason (cadr extracted)))))
+           (denied (list :block (gptel-tool-policy--deny-message denied)))
+           ;; Anything but an explicit `allow' asks, so a malformed default
+           ;; action fails closed.
+           ((seq-some (lambda (d) (not (eq (plist-get d :action) 'allow))) decisions)
+            (list :confirm t))
+           (t (list :confirm nil))))))))
 
-
+
 ;;;; Hook function -- the only integration point with gptel
 
 (defun gptel-tool-policy--hook (tool-call &rest _)
@@ -807,10 +782,6 @@ TOOL-CALL is treated as read-only: the policy never rewrites :args, so it can
 neither redirect a call nor be used as a path-rewriting sandbox -- that is out
 of scope by design."
   (condition-case err
-      ;; The body of a `condition-case' is a single form, so the bypass test
-      ;; lives inside this `let' rather than sitting before it.  With the
-      ;; `proper-list-p' guards in place the test cannot signal, which makes
-      ;; the wrapping belt and braces here rather than load-bearing.
       (let ((name (plist-get tool-call :name)))
         (if (gptel-tool-policy--bypassed-p name)
             nil
@@ -890,17 +861,16 @@ Symlinks are resolved: the policy decides on real locations, see
   "Return a comment string combining LABEL and the current time."
   (format "%s at %s" label (format-time-string "%Y-%m-%d %H:%M:%S")))
 
-(defun gptel-tool-policy--prepend-rule (rule scope &optional buffer)
+(defun gptel-tool-policy--prepend-rule (rule scope)
   "Prepend RULE to the session list selected by SCOPE.
-SCOPE is `buffer' (in BUFFER, default the current buffer) or `global'."
+SCOPE is `buffer' (the current buffer) or `global'."
   (unless (gptel-tool-policy--rule-valid-p rule)
     (user-error "Malformed rule: %S" rule))
   (if (eq scope 'global)
       (setq gptel-tool-policy-global-rules
             (cons rule gptel-tool-policy-global-rules))
-    (with-current-buffer (if (buffer-live-p buffer) buffer (current-buffer))
-      (setq-local gptel-tool-policy-buffer-rules
-                  (cons rule gptel-tool-policy-buffer-rules))))
+    (setq-local gptel-tool-policy-buffer-rules
+                (cons rule gptel-tool-policy-buffer-rules)))
   (message "%s rule added (%s scope): %s %s %s"
            (capitalize (symbol-name (gptel-tool-policy--rule-action rule)))
            scope
@@ -944,6 +914,8 @@ layer and lasts for this session only."
 SCOPE is `buffer' or `global'; the rule lasts for this session only."
   (interactive
    (list (gptel-tool-policy--read-class) (gptel-tool-policy--read-scope)))
+  (when (file-remote-p default-directory)
+    (user-error "Refusing to whitelist a remote directory: %s" default-directory))
   (let ((pattern (concat (directory-file-name
                           (file-local-name
                            (gptel-tool-policy--resolve default-directory)))
@@ -967,6 +939,8 @@ need not exist yet.  The rule lasts for this session only."
      (list class scope path)))
   (when (or (null path) (string-empty-p (string-trim path)))
     (user-error "Empty path"))
+  (when (file-remote-p path)
+    (user-error "Refusing to whitelist a remote path: %s" path))
   (gptel-tool-policy--prepend-rule
    (list 'allow class (gptel-tool-policy--pattern-for-file path)
          (gptel-tool-policy--timestamp-comment "Whitelisted"))
@@ -974,14 +948,16 @@ need not exist yet.  The rule lasts for this session only."
 
 (defun gptel-tool-policy--rule-label (source rule &optional index)
   "Return a human readable label for RULE from SOURCE, optionally numbered."
-  (format "%s[%s] %-5s %-6s %s%s"
-          (if index (format "%2d. " index) "")
-          source
-          (or (gptel-tool-policy--rule-action rule) "?")
-          (or (gptel-tool-policy--rule-class rule) "?")
-          (or (gptel-tool-policy--rule-pattern rule) "?")
-          (let ((comment (gptel-tool-policy--rule-comment rule)))
-            (if comment (format "  ;; %s" comment) ""))))
+  (concat (if index (format "%2d. " index) "")
+          (format "[%s] " source)
+          (if (not (proper-list-p rule))
+              (format "%S" rule)
+            (format "%-5s %-6s %s%s"
+                    (or (gptel-tool-policy--rule-action rule) "?")
+                    (or (gptel-tool-policy--rule-class rule) "?")
+                    (or (gptel-tool-policy--rule-pattern rule) "?")
+                    (let ((comment (gptel-tool-policy--rule-comment rule)))
+                      (if comment (format "  ;; %s" comment) ""))))))
 
 (defun gptel-tool-policy--interactive-rules ()
   "Return an alist of (SOURCE . RULE) for the session-only layers.
@@ -1046,74 +1022,25 @@ Rules from `gptel-tool-policy-rules' are never touched."
                  count (if (= count 1) "" "s")))
     (let ((count (length gptel-tool-policy-buffer-rules)))
       (kill-local-variable 'gptel-tool-policy-buffer-rules)
-      (setq-local gptel-tool-policy-buffer-rules nil)
       (message "Cleared %d buffer-local session rule%s in %s"
                count (if (= count 1) "" "s") (buffer-name)))))
 
-(defun gptel-tool-policy--alist-string-keys (alist)
-  "Return the string keys of ALIST, in order.
-Any shape is tolerated: a non-list, an improper list, entries that are not
-conses and entries whose key is not a string are skipped rather than
-signalling.  One of the alists this walks is private to gptel, so it has to
-survive an upstream restructure without breaking the command that uses it."
-  (let ((tail alist) (keys '()))
-    (while (consp tail)
-      (let ((cell (car tail)))
-        (when (and (consp cell) (stringp (car cell)))
-          (push (car cell) keys)))
-      (setq tail (cdr tail)))
-    (nreverse keys)))
-
-(defun gptel-tool-policy--known-tool-names (&optional with-source)
-  "Return tool names for `gptel-tool-policy-add-bypass', sorted and deduped.
-
-Three sources are tried in order; the first that yields anything wins:
-
-  1. `gptel--known-tools' -- every tool registered with gptel, enabled or
-     not.  This is the list the bypass command wants, since it lets you
-     name a tool you have not enabled yet, but the variable is internal to
-     gptel, which is why the two fallbacks below exist.
-  2. `gptel-tools' -- the enabled tools only, read through the public
-     accessor `gptel-tool-name'.
-  3. `gptel-tool-policy-tool-registry' -- the tools this policy covers.
-
-Falling back on an empty level 1 as well as an unbound one matters: gptel can
-be loaded with no tools registered yet, and completion with `require-match'
-against an empty table would make the command impossible to complete.
-
-With WITH-SOURCE non-nil, return a cons cell of SOURCE and NAMES instead of
-NAMES alone, where SOURCE is `known-tools', `enabled' or `registry'; the
-command uses it to say that the offered list is narrower than intended.
-Never signals, whatever shape those sources are in."
-  (let* ((source 'known-tools)
-         (names
-          (and (boundp 'gptel--known-tools)
-               (let ((tail gptel--known-tools) (acc '()))
-                 (while (consp tail)
-                   (let ((category (car tail)))
-                     (when (consp category)
-                       (setq acc
-                             (nconc acc (gptel-tool-policy--alist-string-keys
-                                         (cdr category))))))
-                   (setq tail (cdr tail)))
-                 acc))))
-    (unless names
-      (setq source 'enabled
-            names (and (boundp 'gptel-tools)
-                       (fboundp 'gptel-tool-name)
-                       (let ((tail gptel-tools) (acc '()))
-                         (while (consp tail)
-                           (let ((name (ignore-errors
-                                         (gptel-tool-name (car tail)))))
-                             (when (stringp name) (push name acc)))
-                           (setq tail (cdr tail)))
-                         (nreverse acc)))))
-    (unless names
-      (setq source 'registry
-            names (gptel-tool-policy--alist-string-keys
-                   gptel-tool-policy-tool-registry)))
-    (setq names (sort (delete-dups names) #'string<))
-    (if with-source (cons source names) names)))
+(defun gptel-tool-policy--known-tool-names ()
+  "Return tool names to offer when adding a session bypass, sorted and deduped.
+Gathered from gptel's known tools (enabled or not), from the enabled tools,
+and from this policy's registry, which is always included.  The completion
+does not require a match, so an incomplete list is harmless; this only saves
+typing.  Never signals, whatever shape gptel's internals are in."
+  (let ((names (mapcar #'car gptel-tool-policy-tool-registry)))
+    (ignore-errors
+      (dolist (category gptel--known-tools)
+        (dolist (entry (cdr category))
+          (when (stringp (car entry)) (push (car entry) names)))))
+    (ignore-errors
+      (dolist (tool gptel-tools)
+        (let ((name (gptel-tool-name tool)))
+          (when (stringp name) (push name names)))))
+    (sort (seq-uniq names) #'string<)))
 
 ;;;###autoload
 (defun gptel-tool-policy-add-bypass (name)
@@ -1125,25 +1052,15 @@ gptel's own confirmation settings still apply.  Read the docstring of
 `gptel-tool-policy-bypass-tools' first: this is unconditional trust, and it
 overrides the deny rules shipped for ~/.ssh, ~/.gnupg and friends.
 
-Interactively, NAME is completed from the tools gptel knows about, enabled or
-not, and must be one of them.  The prompt says so when that list had to fall
-back to a narrower source; see `gptel-tool-policy--known-tool-names'.
+Interactively, NAME is completed from the tools gptel knows about and this
+policy's registry, but any name may be entered: a tool need not exist yet to
+be trusted.
 
 Nothing is added when NAME is already covered by either layer -- the layer
 covering it is reported instead -- so running this twice is a no-op.  The
 defcustom is never modified.  Returns the session bypass list."
   (interactive
-   (let* ((table (gptel-tool-policy--known-tool-names t))
-          (names (cdr table))
-          (prompt (cond
-                   ((eq (car table) 'enabled)
-                    "Bypass tool (list degraded to gptel's enabled tools): ")
-                   ((eq (car table) 'registry)
-                    "Bypass tool (list degraded to the policy registry): ")
-                   (t "Bypass tool: "))))
-     (unless names
-       (user-error "No tool names to complete against; is gptel loaded?"))
-     (list (completing-read prompt names nil t))))
+   (list (completing-read "Bypass tool: " (gptel-tool-policy--known-tool-names))))
   (unless (stringp name)
     (user-error "Tool name must be a string: %S" name))
   (let ((name (string-trim name)))
@@ -1200,6 +1117,10 @@ reported as ignored rather than dropped silently: it grants no bypass at all
   (interactive)
   (let* ((origin (current-buffer))
          (entries (gptel-tool-policy--layered-rules origin))
+         ;; In ORIGIN: a buffer-local hook list without t skips the global one.
+         (active (and (boundp 'gptel-pre-tool-call-functions)
+                      (run-hook-wrapped 'gptel-pre-tool-call-functions
+                                        (lambda (f) (eq f #'gptel-tool-policy--hook)))))
          (buffer (get-buffer-create "*gptel tool policy*")))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
@@ -1208,10 +1129,7 @@ reported as ignored rather than dropped silently: it grants no bypass at all
                         (buffer-name origin)))
         (insert (make-string 70 ?=) "\n\n")
         (insert (format "Policy active         : %s\n"
-                        (if (and (boundp 'gptel-pre-tool-call-functions)
-                                 (memq #'gptel-tool-policy--hook
-                                       gptel-pre-tool-call-functions))
-                            "yes" "no (enable gptel-tool-policy-mode)"))
+                        (if active "yes" "no (enable gptel-tool-policy-mode)"))
                 (format "Default action        : %s\n" gptel-tool-policy-default-action)
                 (format "Deny message          : %s\n" gptel-tool-policy-deny-message)
                 (format "Registered tools      : %s\n"
@@ -1247,17 +1165,5 @@ reported as ignored rather than dropped silently: it grants no bypass at all
     buffer))
 
 (provide 'gptel-tool-policy)
-
-;; Report a bypass list that is not a proper list.  Such a value grants no
-;; bypass -- see `gptel-tool-policy--bypassed-p' -- so this is unconditional:
-;; a configuration that is being discarded is worth knowing about whether or
-;; not the policy is armed at load.
-(gptel-tool-policy--validate-bypass-lists)
-
-;; Arm the policy as soon as this file is loaded: a security layer you forgot
-;; to switch on protects nothing.  Set `gptel-tool-policy-enable-on-load' to
-;; nil before loading to opt out.
-(when gptel-tool-policy-enable-on-load
-  (gptel-tool-policy-mode 1))
 
 ;;; gptel-tool-policy.el ends here
